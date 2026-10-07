@@ -1,0 +1,112 @@
+# Reproduce the druntime/test/shared dllgc crash seen on Azure for PR #23980.
+# Builds dmd + druntime like .azure-pipelines/windows.sh, then runs the shared-druntime
+# tests (where Azure crashed) and dllgc repeatedly, for four variants:
+#   unpatched-origtest     : master druntime, original test             (baseline)
+#   unpatched-explicitdtor : master druntime, Task gets an empty ~this() (pre-existing bug?)
+#   patched-origtest       : field-dtor finalize fix, original test     (the PR)
+#   patched-runtimefix     : PR + rt_termSharedModule runs the DLL's finalizers on unload
+name: dllgc repro
+
+on:
+  push:
+    branches: [windows-dllgc-repro]
+  workflow_dispatch:
+
+env:
+  PATCH_COMMIT: 7a2b1cbc7bd863ec69aadc33a0807166fc928b06 # Fix #23979
+  RUNS: 30
+
+jobs:
+  dllgc:
+    name: ${{ matrix.variant }} (x${{ matrix.model == 32 && '86' || '64' }})
+    runs-on: windows-2022
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        model: [64, 32]
+        variant: [unpatched-origtest, unpatched-explicitdtor, patched-origtest, patched-runtimefix]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 5
+
+      - name: Select variant
+        run: |
+          set -eux
+          # all variants use the original test
+          git checkout "$PATCH_COMMIT" -- druntime/test/shared/src/dllgc.d
+          case "${{ matrix.variant }}" in
+            unpatched-*) git checkout "$PATCH_COMMIT~1" -- druntime/src/core/lifetime.d ;;
+          esac
+          case "${{ matrix.variant }}" in
+            *-explicitdtor) sed -i '0,/        ThreadID tid;/s//        ThreadID tid;\n        ~this() {}/' druntime/test/shared/src/dllgc.d ;;
+            *-runtimefix) git apply .github/dllgc-repro/runtime-fix.patch ;;
+          esac
+          git diff HEAD --stat
+          grep -n '"__xdtor"' druntime/src/core/lifetime.d || echo "lifetime.d: unpatched"
+          lt=$(grep -q '"__xdtor"' druntime/src/core/lifetime.d && echo patched || echo unpatched)
+          tt=$(grep -q "~this() {}" druntime/test/shared/src/dllgc.d && echo "Task with ~this()" || echo original)
+          rf=$(grep -q "GC.runFinalizers(code)" druntime/src/rt/sections_win64.d && echo yes || echo no)
+          echo "::notice title=variant::lifetime.d=$lt, dllgc.d=$tt, runtime fix=$rf"
+
+      - uses: dlang-community/setup-dlang@v2
+        with:
+          compiler: dmd-2.113.0
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.model == 32 && 'x86' || 'x64' }}
+
+      - name: Build dmd and druntime
+        run: |
+          set -eux -o pipefail
+          # on failure, publish the end of the output as an annotation (readable without log access)
+          exec > >(tee build.log) 2>&1
+          trap 'rc=$?; [ $rc -ne 0 ] && echo "::error title=build failed::$(tail -40 build.log | sed -e "s/%/%25/g" | sed -e ":a;N;\$!ba;s/\n/%0A/g")"' EXIT
+          echo "make: $(command -v make) / $(command -v mingw32-make || true)"; echo "link: $(command -v link)"; echo "cl: $(command -v cl)"
+          MAKE="$(command -v make || command -v mingw32-make)"
+          echo "MAKE=$MAKE" >> "$GITHUB_ENV"
+          export HOST_DMD="$(cygpath -m "$(command -v dmd.exe)")"
+          "$MAKE" -j4 MODEL=${{ matrix.model }} HOST_DMD="$HOST_DMD" HOST_DFLAGS="-L-LARGEADDRESSAWARE" \
+            ENABLE_RELEASE=1 ENABLE_ASSERTS=1 dmd
+          DMD_BIN="$PWD/generated/windows/release/${{ matrix.model }}/dmd.exe"
+          echo "DMD_BIN=$DMD_BIN" >> "$GITHUB_ENV"
+          for b in release debug; do
+            "$MAKE" -j4 -C druntime MODEL=${{ matrix.model }} DMD="$DMD_BIN" BUILD=$b
+          done
+
+
+      # The Azure crash happened here: druntime as a DLL (druntime_shared.dll), test built
+      # with -version=SharedRuntime. Same command as .azure-pipelines/windows.sh.
+      - name: druntime shared unittest (as on Azure)
+        if: always()
+        run: |
+          set +e -u -o pipefail   # GitHub runs bash with -e; keep going to report results
+          cd druntime
+          rm -rf test/shared/generated
+          "$MAKE" -j2 unittest MODEL=${{ matrix.model }} SHARED=1 DMD="$DMD_BIN" CC=cl.exe UT_SRCS=src/object.d ADDITIONAL_TESTS=test/shared 2>&1 | tee ../shared.log
+          rc=${PIPESTATUS[0]}
+          echo "::notice title=shared unittest::make exit code $rc"
+          if [ $rc -ne 0 ]; then
+            echo "::error title=shared unittest failed::$(grep -E 'Error|\*\*\*|Testing' ../shared.log | tail -30 | sed -e 's/%/%25/g' | sed -e ':a;N;$!ba;s/\n/%0A/g')"
+          fi
+
+          # repeat the shared-mode dllgc binaries (built by the make above, if it got that far)
+          crashes=0
+          for b in release debug; do
+            dir="test/shared/generated/windows/$b/${{ matrix.model }}"
+            so="$PWD/../generated/windows/$b/${{ matrix.model }}"
+            [ -f "$dir/dllgc.exe" ] || { echo "::warning title=shared dllgc $b::not built"; continue; }
+            codes=""; bad=0
+            for i in $(seq "$RUNS"); do
+              ( cd "$dir" && PATH="$so:$PATH" ./dllgc.exe ) > /dev/null 2>&1
+              r=$?; codes="$codes $r"; [ $r -ne 0 ] && bad=$((bad + 1))
+            done
+            echo "::notice title=shared dllgc $b::$bad/$RUNS runs failed; exit codes:$codes"
+            crashes=$((crashes + bad))
+          done
+          [ $rc -eq 0 ] && [ $crashes -eq 0 ]
