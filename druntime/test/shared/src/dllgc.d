@@ -34,10 +34,14 @@ version(DLL)
         }
     }
 
+    // The low-level thread is the only user of the task, but the GC does not scan
+    // it, so keep the task reachable or it is finalized while the thread runs.
+    __gshared Task task;
+
     static this()
     {
-        auto tsk = new Task;
-        assert(tsk.tid != ThreadID.init);
+        task = new Task;
+        assert(task.tid != ThreadID.init);
     }
 
     static ~this()
